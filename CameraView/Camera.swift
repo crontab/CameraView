@@ -7,18 +7,18 @@
 //  https://developer.apple.com/tutorials/sample-apps/capturingphotos-captureandsave
 //
 
-import AVFoundation
-import CoreImage // for CIImage
-import SwiftUI // for Image
+@preconcurrency import AVFoundation
+import CoreImage.CIImage
+import UIKit.UIImage
 
 
-class Camera: NSObject {
+@MainActor
+final class Camera: NSObject {
 	private let captureSession = AVCaptureSession()
 	private var isCaptureSessionConfigured = false
 	private var deviceInput: AVCaptureDeviceInput?
 	private var photoOutput: AVCapturePhotoOutput?
 	private var videoOutput: AVCaptureVideoDataOutput?
-	private var sessionQueue: DispatchQueue!
 
 	private var allCaptureDevices: [AVCaptureDevice] {
 		AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInTrueDepthCamera, .builtInDualCamera, .builtInDualWideCamera, .builtInWideAngleCamera, .builtInDualWideCamera], mediaType: .video, position: .unspecified).devices
@@ -58,9 +58,7 @@ class Camera: NSObject {
 	private var captureDevice: AVCaptureDevice? {
 		didSet {
 			guard let captureDevice = captureDevice else { return }
-			sessionQueue.async {
-				self.updateSessionForCaptureDevice(captureDevice)
-			}
+			updateSessionForCaptureDevice(captureDevice)
 		}
 	}
 
@@ -80,15 +78,15 @@ class Camera: NSObject {
 
 	private var addToPhotoStream: ((UIImage) -> Void)?
 
-	private var addToPreviewStream: ((CIImage) -> Void)?
+	private var addToPreviewStream: ((UIImage) -> Void)?
 
 	var isPreviewPaused = false
 
-	lazy var previewStream: AsyncStream<CIImage> = {
+	lazy var previewStream: AsyncStream<UIImage> = {
 		AsyncStream { continuation in
-			addToPreviewStream = { ciImage in
+			addToPreviewStream = { uiImage in
 				if !self.isPreviewPaused {
-					continuation.yield(ciImage)
+					continuation.yield(uiImage)
 				}
 			}
 		}
@@ -104,11 +102,6 @@ class Camera: NSObject {
 
 	init(forSelfie: Bool) {
 		super.init()
-		initialize(forSelfie: forSelfie)
-	}
-
-	private func initialize(forSelfie: Bool) {
-		sessionQueue = DispatchQueue(label: "session queue")
 
 		let device = availableCaptureDevices.first {
 			$0.position == (forSelfie ? .front : .back)
@@ -166,7 +159,7 @@ class Camera: NSObject {
 		self.photoOutput = photoOutput
 		self.videoOutput = videoOutput
 
-		photoOutput.isHighResolutionCaptureEnabled = true
+		//        photoOutput.isHighResolutionCaptureEnabled = true
 		photoOutput.maxPhotoQualityPrioritization = .quality
 
 		updateVideoOutputConnection()
@@ -181,9 +174,7 @@ class Camera: NSObject {
 			case .authorized:
 				return true
 			case .notDetermined:
-				sessionQueue.suspend()
 				let status = await AVCaptureDevice.requestAccess(for: .video)
-				sessionQueue.resume()
 				return status
 			case .denied:
 				return false
@@ -242,17 +233,17 @@ class Camera: NSObject {
 
 		if isCaptureSessionConfigured {
 			if !captureSession.isRunning {
-				sessionQueue.async { [self] in
-					self.captureSession.startRunning()
+				Task.detached {
+					await self.captureSession.startRunning()
 				}
 			}
 			return
 		}
 
-		sessionQueue.async { [self] in
-			self.configureCaptureSession { success in
-				guard success else { return }
-				self.captureSession.startRunning()
+		configureCaptureSession { success in
+			guard success else { return }
+			Task.detached {
+				await self.captureSession.startRunning()
 			}
 		}
 	}
@@ -261,9 +252,7 @@ class Camera: NSObject {
 		guard isCaptureSessionConfigured else { return }
 
 		if captureSession.isRunning {
-			sessionQueue.async {
-				self.captureSession.stopRunning()
-			}
+			captureSession.stopRunning()
 		}
 	}
 
@@ -302,36 +291,34 @@ class Camera: NSObject {
 	func takePhoto() {
 		guard let photoOutput = self.photoOutput else { return }
 
-		sessionQueue.async {
+		var photoSettings = AVCapturePhotoSettings()
 
-			var photoSettings = AVCapturePhotoSettings()
-
-			if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
-				photoSettings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
-			}
-
-			let isFlashAvailable = self.deviceInput?.device.isFlashAvailable ?? false
-			photoSettings.flashMode = isFlashAvailable ? .auto : .off
-			photoSettings.isHighResolutionPhotoEnabled = true
-			if let previewPhotoPixelFormatType = photoSettings.availablePreviewPhotoPixelFormatTypes.first {
-				photoSettings.previewPhotoFormat = [kCVPixelBufferPixelFormatTypeKey as String: previewPhotoPixelFormatType]
-			}
-			photoSettings.photoQualityPrioritization = .balanced
-
-			if let photoOutputVideoConnection = photoOutput.connection(with: .video) {
-				if photoOutputVideoConnection.isVideoOrientationSupported,
-				   let videoOrientation = self.videoOrientationFor(self.deviceOrientation) {
-					photoOutputVideoConnection.videoOrientation = videoOrientation
-				}
-			}
-
-			photoOutput.capturePhoto(with: photoSettings, delegate: self)
+		if photoOutput.availablePhotoCodecTypes.contains(.hevc) {
+			photoSettings = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.hevc])
 		}
+
+		let isFlashAvailable = self.deviceInput?.device.isFlashAvailable ?? false
+		photoSettings.flashMode = isFlashAvailable ? .auto : .off
+//		photoSettings.isHighResolutionPhotoEnabled = true
+		if let previewPhotoPixelFormatType = photoSettings.availablePreviewPhotoPixelFormatTypes.first {
+			photoSettings.previewPhotoFormat = [kCVPixelBufferPixelFormatTypeKey as String: previewPhotoPixelFormatType]
+		}
+		photoSettings.photoQualityPrioritization = .balanced
+
+		if let photoOutputVideoConnection = photoOutput.connection(with: .video) {
+			if photoOutputVideoConnection.isVideoOrientationSupported,
+			   let videoOrientation = self.videoOrientationFor(self.deviceOrientation) {
+				photoOutputVideoConnection.videoOrientation = videoOrientation
+			}
+		}
+
+		photoOutput.capturePhoto(with: photoSettings, delegate: self)
 	}
 }
 
 extension Camera: AVCapturePhotoCaptureDelegate {
 
+	nonisolated
 	func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
 
 		if let error {
@@ -345,21 +332,30 @@ extension Camera: AVCapturePhotoCaptureDelegate {
 
 		let uiImage = UIImage(cgImage: cgImage, scale: 1, orientation: UIImage.Orientation(cgImageOrientation))
 
-		addToPhotoStream?(uiImage)
+		Task { @MainActor in
+			addToPhotoStream?(uiImage)
+		}
 	}
 }
 
+
 extension Camera: AVCaptureVideoDataOutputSampleBufferDelegate {
 
+	nonisolated
 	func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
 		guard let pixelBuffer = sampleBuffer.imageBuffer else { return }
+		let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+		guard let cgImage = CIContext().createCGImage(ciImage, from: ciImage.extent) else { return }
+		let uiImage = UIImage(cgImage: cgImage)
 
-		if connection.isVideoOrientationSupported,
-		   let videoOrientation = videoOrientationFor(deviceOrientation) {
-			connection.videoOrientation = videoOrientation
+		Task { @MainActor in
+			if connection.isVideoOrientationSupported,
+			   let videoOrientation = videoOrientationFor(deviceOrientation) {
+				connection.videoOrientation = videoOrientation
+			}
+
+			addToPreviewStream?(uiImage)
 		}
-
-		addToPreviewStream?(CIImage(cvPixelBuffer: pixelBuffer))
 	}
 }
 

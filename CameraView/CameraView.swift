@@ -63,7 +63,7 @@ struct CameraView: View {
 
 	private func handleCameraPreviews() async {
 		// This is the video stream, just map it to the viewfinder
-		let imageStream = camera.previewStream.map { $0.image }
+		let imageStream = camera.previewStream.map { Image(uiImage: $0) }
 		for await image in imageStream {
 			Task { @MainActor in
 				viewfinderImage = image
